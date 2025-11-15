@@ -1,7 +1,8 @@
-import { makeWASocket, useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
+import { makeWASocket, DisconnectReason, useMultiFileAuthState, BufferJSON } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import path from 'path';
 import fs from 'fs';
+import SessionPersistence from './SessionPersistence.js';
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
@@ -9,6 +10,7 @@ class SessionManager {
   constructor() {
     this.sessions = new Map();
     this.sessionDir = process.env.SESSION_STORAGE_PATH || './auth_sessions';
+    this.persistence = new SessionPersistence();
 
     // Ensure session directory exists
     if (!fs.existsSync(this.sessionDir)) {
@@ -16,7 +18,29 @@ class SessionManager {
     }
   }
 
-  async createSession(sessionId, callbacks = {}) {
+  /**
+   * טעינת כל ה-sessions הפעילים בזמן הפעלת השרת
+   * פותר את הבעיה של sessions שנעלמים אחרי restart
+   */
+  async restoreAllSessions() {
+    logger.info('🔄 Restoring active sessions from database...');
+
+    const activeSessions = await this.persistence.getActiveSessions();
+
+    for (const sessionData of activeSessions) {
+      try {
+        logger.info(`🔄 Restoring session: ${sessionData.session_id} (${sessionData.phone_number || 'unknown'})`);
+        await this.createSession(sessionData.session_id, {}, sessionData.auth_state);
+      } catch (error) {
+        logger.error(`❌ Failed to restore session ${sessionData.session_id}:`, error);
+        await this.persistence.updateSessionStatus(sessionData.session_id, 'error', null, error.message);
+      }
+    }
+
+    logger.info(`✅ Restored ${activeSessions.length} sessions`);
+  }
+
+  async createSession(sessionId, callbacks = {}, existingAuthState = null) {
     if (this.sessions.has(sessionId)) {
       throw new Error(`Session ${sessionId} already exists`);
     }
@@ -45,8 +69,12 @@ class SessionManager {
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
-      if (qr && callbacks.onQR) {
-        callbacks.onQR(qr);
+      if (qr) {
+        // שמור QR ב-DB ושלח ל-callback
+        await this.persistence.saveQRCode(sessionId, qr);
+        if (callbacks.onQR) {
+          callbacks.onQR(qr);
+        }
       }
 
       if (connection === 'close') {
@@ -55,8 +83,11 @@ class SessionManager {
         logger.info(`Session ${sessionId} closed. Reconnect: ${shouldReconnect}`);
 
         if (shouldReconnect) {
+          await this.persistence.updateSessionStatus(sessionId, 'disconnected', null, lastDisconnect?.error?.message);
           setTimeout(() => this.createSession(sessionId, callbacks), 3000);
         } else {
+          // Logged out - מחק session
+          await this.persistence.updateSessionStatus(sessionId, 'disconnected', null, 'Logged out');
           this.sessions.delete(sessionId);
           if (callbacks.onDisconnect) callbacks.onDisconnect();
         }
@@ -68,6 +99,10 @@ class SessionManager {
         session.phoneNumber = sock.user.id.split(':')[0];
 
         logger.info(`✅ Session ${sessionId} connected: ${session.phoneNumber}`);
+
+        // עדכן סטטוס ב-DB
+        await this.persistence.updateSessionStatus(sessionId, 'connected', session.phoneNumber);
+        await this.persistence.resetReconnectAttempts(sessionId);
 
         if (callbacks.onConnected) {
           callbacks.onConnected({
@@ -83,9 +118,17 @@ class SessionManager {
 
     // Handle incoming messages
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type === 'notify' && callbacks.onMessage) {
+      if (type === 'notify') {
         for (const msg of messages) {
-          callbacks.onMessage(msg);
+          // קבל organization_id מה-session
+          const sessionData = await this.persistence.loadAuthState(sessionId);
+
+          if (callbacks.onMessage) {
+            callbacks.onMessage(msg);
+          }
+
+          // שמור הודעה ב-DB (יטופל על ידי המערכת המרכזית)
+          logger.debug(`📨 Received message: ${msg.key.id}`);
         }
       }
     });
@@ -192,6 +235,34 @@ class SessionManager {
 
     const formatted = participants.map(p => p.includes('@') ? p : `${p}@s.whatsapp.net`);
     return await session.sock.groupParticipantsUpdate(groupJid, formatted, 'promote');
+  }
+
+  async getGroupMetadata(sessionId, groupJid) {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.status !== 'connected') {
+      throw new Error(`Session ${sessionId} not connected`);
+    }
+
+    return await session.sock.groupMetadata(groupJid);
+  }
+
+  async removeGroupParticipants(sessionId, groupJid, participants) {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.status !== 'connected') {
+      throw new Error(`Session ${sessionId} not connected`);
+    }
+
+    const formatted = participants.map(p => p.includes('@') ? p : `${p}@s.whatsapp.net`);
+    return await session.sock.groupParticipantsUpdate(groupJid, formatted, 'remove');
+  }
+
+  async leaveGroup(sessionId, groupJid) {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.status !== 'connected') {
+      throw new Error(`Session ${sessionId} not connected`);
+    }
+
+    return await session.sock.groupLeave(groupJid);
   }
 }
 

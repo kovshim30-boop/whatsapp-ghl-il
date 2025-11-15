@@ -59,9 +59,17 @@ io.on('connection', (socket) => {
 
 // Start server
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
   logger.info(`🚀 Server running on port ${PORT}`);
   logger.info(`📡 WebSocket server ready`);
+
+  // טעינת כל ה-sessions הפעילים מה-DB (session persistence!)
+  try {
+    await sessionManager.restoreAllSessions();
+    logger.info(`✅ Session restoration completed`);
+  } catch (error) {
+    logger.error(`❌ Failed to restore sessions:`, error);
+  }
 });
 
 export { io, sessionManager };
